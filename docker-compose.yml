@@ -1,0 +1,86 @@
+services:
+  apex_engine_bridge:
+    build: .
+    container_name: apex_engine_bridge
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - .:/app
+    networks:
+      - apex_network
+      - apex_internal_network
+    depends_on:
+      - postgres_vault
+
+  postgres_vault:
+    image: postgres:15-alpine
+    container_name: apex_postgres_vault
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - apex_network
+
+  minio_lake:
+    image: minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: apex_minio_lake
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - apex_network
+
+  clickhouse_lake:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: apex_clickhouse_lake
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - apex_network
+
+  redis_queue:
+    image: redis:7-alpine
+    container_name: apex_redis_queue
+    restart: always
+    networks:
+      - apex_internal_network
+
+  ingestion_gateway:
+    build:
+      context: ./ingestion_gateway
+    container_name: apex_ingestion_gateway
+    restart: unless-stopped
+    depends_on:
+      - redis_queue
+    environment:
+      - REDIS_HOST=redis_queue
+      - TRADINGVIEW_SECRET=${TRADINGVIEW_SECRET}
+    ports:
+      - "80:5000"
+    networks:
+      - apex_internal_network
+
+volumes:
+  postgres_data:
+  minio_data:
+  clickhouse_data:
+
+networks:
+  apex_network:
+    driver: bridge
+  apex_internal_network:
+    driver: bridge
