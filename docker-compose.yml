@@ -52,6 +52,28 @@ services:
     networks:
       - apex_network
 
+  execution_engine:
+    build: .
+    container_name: apex_execution_engine
+    restart: unless-stopped
+    env_file: .env
+    command: python execution_engine.py
+    depends_on:
+      - redis_queue
+    networks:
+      - apex_internal_network
+
+  strategy_mvp:
+    build: .
+    container_name: apex_strategy_mvp
+    restart: unless-stopped
+    env_file: .env
+    command: python strategy_mvp.py
+    depends_on:
+      - redis_queue
+    networks:
+      - apex_internal_network
+
   redis_queue:
     image: redis:7-alpine
     container_name: apex_redis_queue
