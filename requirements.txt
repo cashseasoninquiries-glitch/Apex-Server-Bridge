@@ -1,3 +1,7 @@
 psycopg2-binary==2.9.9
 redis==5.0.3
 alpaca-py
+flask
+python-dotenv
+cryptography
+watchdog
