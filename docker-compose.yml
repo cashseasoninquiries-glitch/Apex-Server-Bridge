@@ -78,6 +78,9 @@ services:
     image: redis:7-alpine
     container_name: apex_redis_queue
     restart: always
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     networks:
       - apex_internal_network
 
@@ -92,9 +95,22 @@ services:
       - REDIS_HOST=redis_queue
       - TRADINGVIEW_SECRET=${TRADINGVIEW_SECRET}
     ports:
-      - "80:5000"
+      - "127.0.0.1:5000:5500"
     networks:
       - apex_internal_network
+
+  recorder:
+    build:
+      context: ./recorder
+    container_name: apex_recorder
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - redis_queue
+      - postgres_vault
+    networks:
+      - apex_internal_network
+      - apex_network
 
 volumes:
   postgres_data:
