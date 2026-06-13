@@ -55,8 +55,10 @@ services:
   redis_queue:
     image: redis:7-alpine
     container_name: apex_redis_queue
+    volumes:
+      - redis_data:/data
     restart: always
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    command: redis-server --requirepass ${REDIS_PASSWORD} --save 60 1 --appendonly yes
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD}
     networks:
@@ -113,6 +115,7 @@ services:
       - apex_network
 
 volumes:
+  redis_data:
   postgres_data:
   minio_data:
   clickhouse_data:
