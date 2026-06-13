@@ -10,7 +10,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] EXECUTION: %(message)s')
 
 # --- REDIS CONNECTION ---
-redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0)
+redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0, password=os.getenv('REDIS_PASSWORD'))
 QUEUE_NAME = "apex_signal_queue"
 BUFFER_NAME = "apex_execution_buffer"
 RECORD_QUEUE = "apex_record_queue"
