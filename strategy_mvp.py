@@ -11,7 +11,7 @@ from alpaca.data.timeframe import TimeFrame
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] STRATEGY: %(message)s')
 
 # --- REDIS CONNECTION ---
-redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0)
+redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0, password=os.getenv('REDIS_PASSWORD'))
 SIGNAL_QUEUE = "apex_signal_queue"
 
 # --- ALPACA DATA CLIENT ---
