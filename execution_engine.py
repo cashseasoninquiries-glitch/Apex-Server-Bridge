@@ -3,31 +3,93 @@ import redis
 import json
 import time
 import logging
+import psycopg2
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] EXECUTION: %(message)s')
 
-# --- REDIS CONNECTION ---
+# --- REDIS ---
 redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0, password=os.getenv('REDIS_PASSWORD'))
 QUEUE_NAME = "apex_signal_queue"
 BUFFER_NAME = "apex_execution_buffer"
 RECORD_QUEUE = "apex_record_queue"
 
-# --- ALPACA CONNECTION ---
+# --- ALPACA ---
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "true"
-
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
-
-# --- DEFAULT ORDER SIZE ---
 DEFAULT_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
+
+# --- POSTGRES ---
+DB_DSN = "dbname={} user={} password={} host=apex_postgres_vault".format(
+    os.getenv("POSTGRES_DB", "apex_vault"),
+    os.getenv("POSTGRES_USER", "apex_admin"),
+    os.getenv("POSTGRES_PASSWORD")
+)
+
+
+def get_conn():
+    return psycopg2.connect(DB_DSN)
+
+
+def write_dead_letter(raw_payload, error, source="execution_engine"):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO dead_letters (source, raw_payload, error_message)
+                    VALUES (%s, %s, %s)
+                """, (source, raw_payload.decode('utf-8') if isinstance(raw_payload, bytes) else raw_payload, str(error)))
+            conn.commit()
+        logging.warning(f"Signal written to dead_letters: {str(error)[:80]}")
+    except Exception as db_err:
+        logging.error(f"Failed to write dead letter: {db_err}")
+
+
+def get_strategy_uuid(cur, strategy_name):
+    cur.execute("SELECT id FROM strategies WHERE name = %s", (strategy_name,))
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def has_open_position(cur, strategy_uuid, ticker):
+    cur.execute("""
+        SELECT COUNT(*) FROM trades
+        WHERE strategy_id = %s AND ticker = %s AND status = 'open'
+    """, (strategy_uuid, ticker))
+    return cur.fetchone()[0] > 0
+
+
+def check_position(strategy_name, ticker, action):
+    """
+    Returns (allowed, reason).
+    Checks if the action makes sense given current open positions.
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                strategy_uuid = get_strategy_uuid(cur, strategy_name)
+                if not strategy_uuid:
+                    # Strategy not registered yet — allow and let recorder handle it
+                    return True, "strategy_not_registered"
+
+                open = has_open_position(cur, strategy_uuid, ticker)
+
+                if action == "LONG" and open:
+                    return False, f"Already in open LONG position: {strategy_name} | {ticker}"
+                if action in ("SELL", "SHORT") and not open:
+                    return False, f"No open position to close: {strategy_name} | {ticker}"
+
+                return True, "ok"
+    except Exception as e:
+        logging.error(f"Position check failed: {e} — allowing signal through")
+        return True, "position_check_error"
 
 
 def place_order(symbol, side):
-    """Places a market order on Alpaca."""
     order_request = MarketOrderRequest(
         symbol=symbol,
         qty=DEFAULT_QTY,
@@ -43,9 +105,10 @@ def run_execution_engine():
     logging.info("Apex Execution Engine: ONLINE. Listening for signals...")
     logging.info(f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} | Default Qty: {DEFAULT_QTY}")
 
+    raw_payload = None
+
     while True:
         try:
-            # Atomically move signal from queue to processing buffer
             raw_payload = redis_client.brpoplpush(src=QUEUE_NAME, dst=BUFFER_NAME, timeout=0)
             if not raw_payload:
                 continue
@@ -55,25 +118,33 @@ def run_execution_engine():
             ticker = signal.get("ticker")
             action = signal.get("action", "").upper()
 
+            if not ticker:
+                raise ValueError("Signal missing required field: ticker")
+
             logging.info(f"Signal received: {action} {ticker} from {strategy_id}")
 
-            # Route action to correct order side
-            if action == "LONG":
-                order = place_order(ticker, OrderSide.BUY)
-            elif action == "SHORT" or action == "SELL":
-                order = place_order(ticker, OrderSide.SELL)
-            else:
-                logging.warning(f"Unknown action '{action}' — signal ignored.")
+            # --- POSITION AWARENESS CHECK ---
+            allowed, reason = check_position(strategy_id, ticker, action)
+            if not allowed:
+                logging.warning(f"Signal skipped — {reason}")
                 redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+                write_dead_letter(raw_payload, f"Position check blocked: {reason}", source="position_guard")
+                raw_payload = None
                 continue
 
-            # Acknowledge — remove from buffer after successful order
-            redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+            # --- PLACE ORDER ---
+            if action == "LONG":
+                order = place_order(ticker, OrderSide.BUY)
+            elif action in ("SHORT", "SELL"):
+                order = place_order(ticker, OrderSide.SELL)
+            else:
+                raise ValueError(f"Unknown action '{action}'")
 
-            # Push completed trade record to Postgres recorder
+            redis_client.lrem(BUFFER_NAME, 1, raw_payload)
             record = {**signal, "order_id": str(order.id), "status": "executed"}
             redis_client.lpush(RECORD_QUEUE, json.dumps(record))
-            logging.info(f"Signal processed and buffer cleared: {strategy_id} | {action} {ticker}")
+            logging.info(f"Signal processed: {strategy_id} | {action} {ticker}")
+            raw_payload = None
 
         except redis.ConnectionError:
             logging.error("Redis connection lost. Retrying in 5s...")
@@ -81,9 +152,10 @@ def run_execution_engine():
 
         except Exception as e:
             logging.critical(f"Execution error: {str(e)}")
-            # Remove bad signal from buffer so it doesn't block the queue
             if raw_payload:
                 redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+                write_dead_letter(raw_payload, e)
+                raw_payload = None
             time.sleep(1)
 
 
