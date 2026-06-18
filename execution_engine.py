@@ -26,74 +26,10 @@ RECORD_QUEUE = "apex_record_queue"
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "true"
+
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
 
 DEFAULT_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
-
-# --- POSTGRES ---
-DB_DSN = "dbname={} user={} password={} host=apex_postgres_vault".format(
-    os.getenv("POSTGRES_DB", "apex_vault"),
-    os.getenv("POSTGRES_USER", "apex_admin"),
-    os.getenv("POSTGRES_PASSWORD")
-)
-
-
-def get_conn():
-    return psycopg2.connect(DB_DSN)
-
-
-def write_dead_letter(raw_payload, error, source="execution_engine"):
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO dead_letters (source, raw_payload, error_message)
-                    VALUES (%s, %s, %s)
-                """, (source, raw_payload.decode('utf-8') if isinstance(raw_payload, bytes) else raw_payload, str(error)))
-            conn.commit()
-        logging.warning(f"Signal written to dead_letters: {str(error)[:80]}")
-    except Exception as db_err:
-        logging.error(f"Failed to write dead letter: {db_err}")
-
-
-def get_strategy_uuid(cur, strategy_name):
-    cur.execute("SELECT id FROM strategies WHERE name = %s", (strategy_name,))
-    row = cur.fetchone()
-    return str(row[0]) if row else None
-
-
-def has_open_position(cur, strategy_uuid, ticker):
-    cur.execute("""
-        SELECT COUNT(*) FROM trades
-        WHERE strategy_id = %s AND ticker = %s AND status = 'open'
-    """, (strategy_uuid, ticker))
-    return cur.fetchone()[0] > 0
-
-
-def check_position(strategy_name, ticker, action):
-    """
-    Returns (allowed, reason).
-    Checks if the action makes sense given current open positions.
-    """
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                strategy_uuid = get_strategy_uuid(cur, strategy_name)
-                if not strategy_uuid:
-                    # Strategy not registered yet — allow and let recorder handle it
-                    return True, "strategy_not_registered"
-
-                open = has_open_position(cur, strategy_uuid, ticker)
-
-                if action == "LONG" and open:
-                    return False, f"Already in open LONG position: {strategy_name} | {ticker}"
-                if action in ("SELL", "SHORT") and not open:
-                    return False, f"No open position to close: {strategy_name} | {ticker}"
-
-                return True, "ok"
-    except Exception as e:
-        logging.error(f"Position check failed: {e} — allowing signal through")
-        return True, "position_check_error"
 
 
 def get_db_conn():
@@ -181,8 +117,6 @@ def run_execution_engine():
     logging.info("Apex Execution Engine: ONLINE")
     logging.info(f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} | Default Qty: {DEFAULT_QTY}")
 
-    raw_payload = None
-
     while True:
         raw_payload = None
         try:
@@ -200,8 +134,6 @@ def run_execution_engine():
                 logging.warning(f"Malformed signal — missing ticker or action: {signal}")
                 write_dead_letter(signal, "Missing ticker or action")
                 redis_client.lrem(BUFFER_NAME, 1, raw_payload)
-                write_dead_letter(raw_payload, f"Position check blocked: {reason}", source="position_guard")
-                raw_payload = None
                 continue
 
             logging.info(f"Signal: {action} {ticker} from {strategy_name}")
@@ -241,8 +173,6 @@ def run_execution_engine():
             write_dead_letter(raw_payload, str(e))
             if raw_payload:
                 redis_client.lrem(BUFFER_NAME, 1, raw_payload)
-                write_dead_letter(raw_payload, e)
-                raw_payload = None
             time.sleep(1)
 
 

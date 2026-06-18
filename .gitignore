@@ -20,3 +20,6 @@ Thumbs.db
 *.log
 keymaster.py
 .gemini/
+
+# Dated DB backups — never commit raw data dumps
+backup_*.sql
