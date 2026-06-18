@@ -75,6 +75,33 @@ services:
   # PHASE 1 — CORE PIPELINE
   # ─────────────────────────────────────────────
 
+  redis_queue:
+    image: redis:7-alpine
+    container_name: apex_redis_queue
+    volumes:
+      - redis_data:/data
+    restart: always
+    command: redis-server --requirepass ${REDIS_PASSWORD} --save 60 1 --appendonly yes
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    networks:
+      - apex_internal_network
+
+  ingestion_gateway:
+    build:
+      context: ./ingestion_gateway
+    container_name: apex_ingestion_gateway
+    restart: unless-stopped
+    depends_on:
+      - redis_queue
+    environment:
+      - REDIS_HOST=redis_queue
+      - TRADINGVIEW_SECRET=${TRADINGVIEW_SECRET}
+    ports:
+      - "127.0.0.1:5000:5000"
+    networks:
+      - apex_internal_network
+
   execution_engine:
     build: .
     container_name: apex_execution_engine
@@ -171,8 +198,10 @@ services:
       - redis_queue
     networks:
       - apex_internal_network
+      - apex_network
 
 volumes:
+  redis_data:
   postgres_data:
   redis_data:
   minio_data:
