@@ -7,14 +7,9 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - name: Deploy to Hetzner
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_IP }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            cd /root/Apex_Server_Bridge
-            bash deploy.sh
+      - name: Deploy
+        run: |
+          cd /root/Apex_Server_Bridge
+          bash deploy.sh
