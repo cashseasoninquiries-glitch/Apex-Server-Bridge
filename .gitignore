@@ -18,3 +18,5 @@ Thumbs.db
 .aider*
 # Logs
 *.log
+keymaster.py
+.gemini/

@@ -16,5 +16,5 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /opt/Apex_Server_Bridge
+            cd /root/Apex_Server_Bridge
             bash deploy.sh
