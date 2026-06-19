@@ -78,19 +78,21 @@ def insert_event(cur, strategy_id, signal):
     # Never log the passphrase field
     safe_payload = {k: v for k, v in signal.items() if k != 'passphrase'}
 
+    # order_id and fill_price have no dedicated columns on `events` — they're
+    # preserved inside raw_payload (and order_id is also written to
+    # trades.alpaca_order_id when a trade is opened).
     cur.execute("""
         INSERT INTO events
-            (strategy_id, ticker, action, order_id, signal_price, fill_price, qty, regime, raw_payload)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (strategy_id, ticker, action, signal_price, quantity, source, market_regime, raw_payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         strategy_id,
         signal.get('ticker'),
         signal.get('action'),
-        signal.get('order_id'),
         signal.get('signal_price'),
-        signal.get('fill_price'),
         signal.get('qty', 1),
+        signal.get('source', 'execution_engine'),
         signal.get('regime'),
         json.dumps(safe_payload)
     ))
@@ -101,14 +103,18 @@ def open_trade(cur, strategy_id, signal, event_id):
     """Create an open trade record for LONG signals."""
     cur.execute("""
         INSERT INTO trades
-            (strategy_id, ticker, direction, entry_event_id, entry_price, qty, status, opened_at)
-        VALUES (%s, %s, 'LONG', %s, %s, %s, 'open', NOW())
+            (strategy_id, ticker, direction, entry_event_id, entry_price, quantity,
+             status, entry_at, alpaca_order_id, entry_regime, is_paper)
+        VALUES (%s, %s, 'LONG', %s, %s, %s, 'open', NOW(), %s, %s, %s)
     """, (
         strategy_id,
         signal.get('ticker'),
         event_id,
         signal.get('fill_price') or signal.get('signal_price'),
-        signal.get('qty', 1)
+        signal.get('qty', 1),
+        signal.get('order_id'),
+        signal.get('regime'),
+        signal.get('is_paper', True)
     ))
     logging.info(f"Trade opened: {signal.get('ticker')} for {strategy_id}")
 
@@ -120,10 +126,10 @@ def close_trade(cur, strategy_id, signal, event_id):
     Returns strategy_id if successful, None otherwise.
     """
     cur.execute("""
-        SELECT id, entry_price, qty
+        SELECT id, entry_price, quantity
         FROM trades
         WHERE strategy_id = %s AND ticker = %s AND status = 'open'
-        ORDER BY opened_at DESC
+        ORDER BY entry_at DESC
         LIMIT 1
     """, (strategy_id, signal.get('ticker')))
 
@@ -143,6 +149,7 @@ def close_trade(cur, strategy_id, signal, event_id):
     pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0
 
     # Slippage = distance between where signal said to exit vs where Alpaca actually filled
+    # (no dedicated column on `trades` for this — logged only, also retained in events.raw_payload)
     signal_price = float(signal.get('signal_price') or exit_price)
     slippage = abs(exit_price - signal_price)
 
@@ -152,11 +159,12 @@ def close_trade(cur, strategy_id, signal, event_id):
             exit_price = %s,
             pnl = %s,
             pnl_pct = %s,
-            slippage = %s,
             status = 'closed',
-            closed_at = NOW()
+            exit_at = NOW(),
+            exit_regime = %s,
+            duration_mins = EXTRACT(EPOCH FROM (NOW() - entry_at)) / 60
         WHERE id = %s
-    """, (event_id, exit_price, pnl, pnl_pct, slippage, trade_id))
+    """, (event_id, exit_price, pnl, pnl_pct, signal.get('regime'), trade_id))
 
     logging.info(
         f"Trade closed: {signal.get('ticker')} | "

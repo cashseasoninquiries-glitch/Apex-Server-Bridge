@@ -160,7 +160,7 @@ def run_execution_engine():
             redis_client.lrem(BUFFER_NAME, 1, raw_payload)
 
             # Hand off to recorder
-            record = {**signal, "order_id": str(order.id), "status": "executed"}
+            record = {**signal, "order_id": str(order.id), "status": "executed", "is_paper": PAPER_TRADING}
             redis_client.lpush(RECORD_QUEUE, json.dumps(record))
             logging.info(f"Executed and queued for recording: {strategy_name} | {action} {ticker}")
 
