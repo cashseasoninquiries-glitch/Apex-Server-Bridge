@@ -6,7 +6,7 @@ import logging
 import psycopg2
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] EXECUTION: %(message)s')
 
@@ -30,6 +30,8 @@ PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "true"
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
 
 DEFAULT_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
+FILL_TIMEOUT_SECS = float(os.getenv("FILL_TIMEOUT_SECS", "10"))
+FILL_POLL_INTERVAL = 0.5
 
 
 def get_db_conn():
@@ -113,6 +115,35 @@ def place_order(symbol, side):
     return order
 
 
+def wait_for_fill(order_id, timeout=FILL_TIMEOUT_SECS, poll_interval=FILL_POLL_INTERVAL):
+    """
+    Poll Alpaca for the order's real fill price. Market orders during trading
+    hours usually fill within a second or two; outside trading hours they sit
+    as 'accepted' and never fill in this window. In that case we time out and
+    return None — the recorder falls back to signal_price, same as before.
+    """
+    elapsed = 0.0
+    while elapsed < timeout:
+        try:
+            order = trading_client.get_order_by_id(order_id)
+        except Exception as e:
+            logging.warning(f"Could not poll order {order_id} for fill price: {e}")
+            return None
+
+        if order.status == OrderStatus.FILLED:
+            return float(order.filled_avg_price) if order.filled_avg_price else None
+
+        if order.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            logging.warning(f"Order {order_id} ended in {order.status.value} before filling")
+            return None
+
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    logging.info(f"Order {order_id} not filled within {timeout}s — recording without fill_price")
+    return None
+
+
 def run_execution_engine():
     logging.info("Apex Execution Engine: ONLINE")
     logging.info(f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} | Default Qty: {DEFAULT_QTY}")
@@ -159,10 +190,23 @@ def run_execution_engine():
             # Acknowledge — remove from buffer after successful execution
             redis_client.lrem(BUFFER_NAME, 1, raw_payload)
 
+            # Briefly poll for the real fill price; falls back to signal_price if it
+            # doesn't fill in time (e.g. order placed outside trading hours).
+            fill_price = wait_for_fill(order.id)
+
             # Hand off to recorder
-            record = {**signal, "order_id": str(order.id), "status": "executed", "is_paper": PAPER_TRADING}
+            record = {
+                **signal,
+                "order_id": str(order.id),
+                "status": "executed",
+                "is_paper": PAPER_TRADING,
+                "fill_price": fill_price
+            }
             redis_client.lpush(RECORD_QUEUE, json.dumps(record))
-            logging.info(f"Executed and queued for recording: {strategy_name} | {action} {ticker}")
+            logging.info(
+                f"Executed and queued for recording: {strategy_name} | {action} {ticker} | "
+                f"fill_price={fill_price if fill_price is not None else 'pending (using signal_price)'}"
+            )
 
         except redis.ConnectionError:
             logging.error("Redis connection lost. Retrying in 5s...")
