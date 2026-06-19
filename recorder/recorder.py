@@ -62,14 +62,22 @@ def upsert_strategy(cur, strategy_name):
     if row:
         return str(row[0])
 
-    # Auto-register — strategy will start in yellow, no params yet
+    # Fallback path only — strategies should normally be registered via
+    # strategy_registry.register_strategy() with real strategy_type/timeframe/
+    # asset_class/parameters BEFORE any signal is emitted. If we get here, an
+    # unregistered strategy name reached the pipeline. We still create a row
+    # (placeholder metadata, flagged in notes) so the pipeline doesn't crash,
+    # but this should be treated as an operational warning, not routine.
     cur.execute(
-        """INSERT INTO strategies (name, lifecycle_state, confidence_stars)
-           VALUES (%s, 'yellow', 0) RETURNING id""",
-        (strategy_name,)
+        """INSERT INTO strategies
+               (name, strategy_type, timeframe, asset_class, parameters,
+                lifecycle_state, confidence_stars, notes)
+           VALUES (%s, 'unclassified', 'unknown', 'equity', '{}'::jsonb, 'yellow', 0, %s)
+           RETURNING id""",
+        (strategy_name, "Auto-registered by recorder fallback — not registered via strategy_registry; review and reclassify")
     )
     new_id = str(cur.fetchone()[0])
-    logging.info(f"Auto-registered new strategy: '{strategy_name}' | {new_id}")
+    logging.warning(f"Auto-registered new strategy via fallback path (needs review): '{strategy_name}' | {new_id}")
     return new_id
 
 
