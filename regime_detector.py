@@ -109,6 +109,7 @@ def detect_regime():
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import DataFeed
 
         client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
@@ -116,7 +117,8 @@ def detect_regime():
             symbol_or_symbols=["SPY"],
             timeframe=TimeFrame.Day,
             start=datetime.now(timezone.utc) - timedelta(days=50),
-            end=datetime.now(timezone.utc)
+            end=datetime.now(timezone.utc),
+            feed=DataFeed.IEX
         )
         bars = client.get_stock_bars(request)
         spy_bars = bars["SPY"]
