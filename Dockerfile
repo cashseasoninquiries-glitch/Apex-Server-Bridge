@@ -26,5 +26,5 @@ COPY . .
 # Expose the port your bridge uses
 EXPOSE 5000
 
-# The engine stays alive and restarts on failure
-CMD ["python", "app.py"]
+# No default CMD on purpose: this image is shared by multiple services
+# 
