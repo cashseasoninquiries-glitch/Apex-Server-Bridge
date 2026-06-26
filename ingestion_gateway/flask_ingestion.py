@@ -1,4 +1,5 @@
 import os
+import sys
 import redis
 import json
 import logging
@@ -12,8 +13,12 @@ app = Flask(__name__)
 redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0)
 QUEUE_NAME = "apex_signal_queue"
 
-# THE PERIMETER SECURITY KEY
-TV_SECRET = os.getenv("TRADINGVIEW_SECRET", "default_dev_secret_change_me")
+# THE PERIMETER SECURITY KEY — fail closed if it's not configured, rather than
+# silently falling back to a default value (which is now public knowledge).
+TV_SECRET = os.getenv("TRADINGVIEW_SECRET")
+if not TV_SECRET:
+    logging.critical("TRADINGVIEW_SECRET is not set. Refusing to start without it.")
+    sys.exit(1)
 
 @app.route('/webhook', methods=['POST'])
 def tradingview_webhook():
@@ -26,7 +31,7 @@ def tradingview_webhook():
         # SECURITY CHECK
         incoming_secret = data.get("passphrase")
         if incoming_secret != TV_SECRET:
-            logging.warning(f"SECURITY BREACH BLOCKED: Invalid passphrase attempt -> {incoming_secret}")
+            logging.warning("SECURITY BREACH BLOCKED: Invalid passphrase attempt (value withheld from logs).")
             return jsonify({"status": "unauthorized", "message": "Invalid passphrase"}), 401
 
         # Extract core routing variables
@@ -38,10 +43,13 @@ def tradingview_webhook():
             logging.error("Rejected: Payload missing critical routing data.")
             return jsonify({"status": "error", "message": "Missing required fields"}), 400
 
+        # Strip the secret before it goes anywhere downstream (queue, DB, logs).
+        safe_data = {k: v for k, v in data.items() if k != "passphrase"}
+
         # Push to the high-speed Redis queue
-        redis_client.lpush(QUEUE_NAME, json.dumps(data))
+        redis_client.lpush(QUEUE_NAME, json.dumps(safe_data))
         logging.info(f"Signal Accepted & Queued: {strategy_id} | {action} {ticker}")
-        
+
         return jsonify({"status": "success", "message": "Signal queued"}), 200
 
     except Exception as e:
