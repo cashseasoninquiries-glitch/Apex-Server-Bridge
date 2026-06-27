@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] GATE
 app = Flask(__name__)
 
 # INTERNAL NETWORK CABLES
-redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0)
+redis_client = redis.Redis(host='apex_redis_queue', port=6379, db=0, password=os.getenv('REDIS_PASSWORD'))
 QUEUE_NAME = "apex_signal_queue"
 
 # THE PERIMETER SECURITY KEY — fail closed if it's not configured, rather than
