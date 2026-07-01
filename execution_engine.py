@@ -7,9 +7,7 @@ import psycopg2
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] EXECUTION: %(message)s')
-
 # --- REDIS ---
 REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
 redis_client = redis.Redis(
@@ -21,19 +19,14 @@ redis_client = redis.Redis(
 QUEUE_NAME = "apex_signal_queue"
 BUFFER_NAME = "apex_execution_buffer"
 RECORD_QUEUE = "apex_record_queue"
-
 # --- ALPACA ---
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "true"
-
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
-
 DEFAULT_QTY = int(os.getenv("DEFAULT_ORDER_QTY", "1"))
 FILL_TIMEOUT_SECS = float(os.getenv("FILL_TIMEOUT_SECS", "10"))
 FILL_POLL_INTERVAL = 0.5
-
-
 def get_db_conn():
     return psycopg2.connect(
         host=os.getenv('POSTGRES_HOST', 'apex_postgres_vault'),
@@ -41,8 +34,6 @@ def get_db_conn():
         user=os.getenv('POSTGRES_USER', 'apex_admin'),
         password=os.getenv('POSTGRES_PASSWORD')
     )
-
-
 def write_dead_letter(raw_payload, error, source="execution_engine"):
     """Capture failed/invalid signals to dead_letters table for manual review."""
     try:
@@ -59,22 +50,16 @@ def write_dead_letter(raw_payload, error, source="execution_engine"):
                 )
     except Exception as e:
         logging.error(f"Failed to write dead letter: {e}")
-
-
 def get_strategy_uuid(cur, strategy_name):
     cur.execute("SELECT id FROM strategies WHERE name = %s", (strategy_name,))
     row = cur.fetchone()
     return str(row[0]) if row else None
-
-
 def has_open_position(cur, strategy_uuid, ticker):
     cur.execute(
         "SELECT COUNT(*) FROM trades WHERE strategy_id = %s AND ticker = %s AND status = 'open'",
         (strategy_uuid, ticker)
     )
     return cur.fetchone()[0] > 0
-
-
 def check_position(strategy_name, ticker, action):
     """
     Gate: prevent double-buying and selling what you don't own.
@@ -84,25 +69,17 @@ def check_position(strategy_name, ticker, action):
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 strategy_uuid = get_strategy_uuid(cur, strategy_name)
-
                 if not strategy_uuid:
-                    # Unknown strategy — allow through, recorder will auto-register it
                     return True, "new strategy"
-
                 open_pos = has_open_position(cur, strategy_uuid, ticker)
-
                 if action == "LONG" and open_pos:
                     return False, f"Blocked: {strategy_name} already has open LONG on {ticker}"
                 if action in ("SELL", "SHORT") and not open_pos:
                     return False, f"Blocked: {strategy_name} has no open position on {ticker} to close"
-
                 return True, "ok"
-
     except Exception as e:
         logging.warning(f"Position check error (allowing through): {e}")
         return True, "position check error — allowing"
-
-
 def place_order(symbol, side):
     order_request = MarketOrderRequest(
         symbol=symbol,
@@ -113,14 +90,10 @@ def place_order(symbol, side):
     order = trading_client.submit_order(order_request)
     logging.info(f"Order placed: {side.value.upper()} {DEFAULT_QTY}x {symbol} | ID: {order.id}")
     return order
-
-
 def wait_for_fill(order_id, timeout=FILL_TIMEOUT_SECS, poll_interval=FILL_POLL_INTERVAL):
     """
-    Poll Alpaca for the order's real fill price. Market orders during trading
-    hours usually fill within a second or two; outside trading hours they sit
-    as 'accepted' and never fill in this window. In that case we time out and
-    return None — the recorder falls back to signal_price, same as before.
+    Poll Alpaca for the order's real fill price. Returns None if order
+    doesn't fill within the timeout window.
     """
     elapsed = 0.0
     while elapsed < timeout:
@@ -129,96 +102,81 @@ def wait_for_fill(order_id, timeout=FILL_TIMEOUT_SECS, poll_interval=FILL_POLL_I
         except Exception as e:
             logging.warning(f"Could not poll order {order_id} for fill price: {e}")
             return None
-
         if order.status == OrderStatus.FILLED:
             return float(order.filled_avg_price) if order.filled_avg_price else None
-
         if order.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
             logging.warning(f"Order {order_id} ended in {order.status.value} before filling")
             return None
-
         time.sleep(poll_interval)
         elapsed += poll_interval
-
     logging.info(f"Order {order_id} not filled within {timeout}s — recording without fill_price")
     return None
+def process_signal(raw_payload):
+    """
+    Process a single signal from the execution buffer.
 
+    Extracted from run_execution_engine()'s inline loop body so this logic
+    can be unit-tested directly without faking an infinite Redis-polling loop.
+    Pure extraction — no behavior change.
 
+    raw_payload: bytes — the raw JSON bytes as received from Redis.
+    """
+    signal = json.loads(raw_payload.decode('utf-8'))
+    strategy_name = signal.get("strategy_id", signal.get("strategy_name", "unknown"))
+    ticker = signal.get("ticker")
+    action = signal.get("action", "").upper()
+    if not ticker or not action:
+        logging.warning(f"Malformed signal — missing ticker or action: {signal}")
+        write_dead_letter(signal, "Missing ticker or action")
+        redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+        return
+    logging.info(f"Signal: {action} {ticker} from {strategy_name}")
+    allowed, reason = check_position(strategy_name, ticker, action)
+    if not allowed:
+        logging.warning(f"Position gate blocked: {reason}")
+        redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+        return
+    if action == "LONG":
+        order = place_order(ticker, OrderSide.BUY)
+    elif action in ("SELL", "SHORT"):
+        order = place_order(ticker, OrderSide.SELL)
+    else:
+        logging.warning(f"Unknown action '{action}' — writing to dead letters")
+        write_dead_letter(signal, f"Unknown action: {action}")
+        redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+        return
+    redis_client.lrem(BUFFER_NAME, 1, raw_payload)
+    fill_price = wait_for_fill(order.id)
+    record = {
+        **signal,
+        "order_id": str(order.id),
+        "status": "executed",
+        "is_paper": PAPER_TRADING,
+        "fill_price": fill_price
+    }
+    redis_client.lpush(RECORD_QUEUE, json.dumps(record))
+    logging.info(
+        f"Executed and queued for recording: {strategy_name} | {action} {ticker} | "
+        f"fill_price={fill_price if fill_price is not None else 'pending (using signal_price)'}"
+    )
 def run_execution_engine():
     logging.info("Apex Execution Engine: ONLINE")
     logging.info(f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} | Default Qty: {DEFAULT_QTY}")
-
     while True:
         raw_payload = None
         try:
-            # Atomic move: signal queue → processing buffer
             raw_payload = redis_client.brpoplpush(src=QUEUE_NAME, dst=BUFFER_NAME, timeout=0)
             if not raw_payload:
                 continue
-
-            signal = json.loads(raw_payload.decode('utf-8'))
-            strategy_name = signal.get("strategy_id", signal.get("strategy_name", "unknown"))
-            ticker = signal.get("ticker")
-            action = signal.get("action", "").upper()
-
-            if not ticker or not action:
-                logging.warning(f"Malformed signal — missing ticker or action: {signal}")
-                write_dead_letter(signal, "Missing ticker or action")
-                redis_client.lrem(BUFFER_NAME, 1, raw_payload)
-                continue
-
-            logging.info(f"Signal: {action} {ticker} from {strategy_name}")
-
-            # Position gate
-            allowed, reason = check_position(strategy_name, ticker, action)
-            if not allowed:
-                logging.warning(f"Position gate blocked: {reason}")
-                redis_client.lrem(BUFFER_NAME, 1, raw_payload)
-                continue
-
-            # Route to Alpaca
-            if action == "LONG":
-                order = place_order(ticker, OrderSide.BUY)
-            elif action in ("SELL", "SHORT"):
-                order = place_order(ticker, OrderSide.SELL)
-            else:
-                logging.warning(f"Unknown action '{action}' — writing to dead letters")
-                write_dead_letter(signal, f"Unknown action: {action}")
-                redis_client.lrem(BUFFER_NAME, 1, raw_payload)
-                continue
-
-            # Acknowledge — remove from buffer after successful execution
-            redis_client.lrem(BUFFER_NAME, 1, raw_payload)
-
-            # Briefly poll for the real fill price; falls back to signal_price if it
-            # doesn't fill in time (e.g. order placed outside trading hours).
-            fill_price = wait_for_fill(order.id)
-
-            # Hand off to recorder
-            record = {
-                **signal,
-                "order_id": str(order.id),
-                "status": "executed",
-                "is_paper": PAPER_TRADING,
-                "fill_price": fill_price
-            }
-            redis_client.lpush(RECORD_QUEUE, json.dumps(record))
-            logging.info(
-                f"Executed and queued for recording: {strategy_name} | {action} {ticker} | "
-                f"fill_price={fill_price if fill_price is not None else 'pending (using signal_price)'}"
-            )
-
+            process_signal(raw_payload)
         except redis.ConnectionError:
             logging.error("Redis connection lost. Retrying in 5s...")
             time.sleep(5)
-
         except Exception as e:
             logging.critical(f"Execution error: {str(e)}")
             write_dead_letter(raw_payload, str(e))
             if raw_payload:
                 redis_client.lrem(BUFFER_NAME, 1, raw_payload)
             time.sleep(1)
-
-
 if __name__ == "__main__":
     run_execution_engine()
