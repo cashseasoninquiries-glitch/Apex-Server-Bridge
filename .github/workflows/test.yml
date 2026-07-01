@@ -1,13 +1,15 @@
-name: Deploy to Apex Server
+name: Test
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
+  pull_request:
+    branches: [master]
 
 jobs:
   test:
     runs-on: self-hosted
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,12 +25,3 @@ jobs:
       - name: Run tests
         run: |
           python3 -m pytest tests/ -v --tb=short
-
-  deploy:
-    runs-on: self-hosted
-    needs: test
-    steps:
-      - name: Deploy
-        run: |
-          cd /root/Apex_Server_Bridge
-          bash deploy.sh
